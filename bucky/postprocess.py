@@ -21,7 +21,7 @@ from pathlib import Path
 
 import networkx as nx
 import numpy as np
-import pandas as pd
+import cudf as pd
 import scipy.stats
 from tqdm import tqdm
 
@@ -228,7 +228,7 @@ if __name__ == "__main__":
         [x.split("/")[-1].split(".")[0].split("_") for x in all_files],
         columns=["rid", "date"],
     )
-    dates = all_files_df.date.unique().tolist()
+    dates = all_files_df.date.unique().to_arrow().to_pylist()
 
     to_write = JoinableQueue()
 
@@ -252,7 +252,7 @@ if __name__ == "__main__":
         date_files = glob.glob(args.file + "/*_" + str(date) + ".feather")  # [:NFILES]
 
         # Read feather files
-        run_data = [pd.read_feather(f) for f in date_files]
+        run_data = [pd.read_parquet(f) for f in date_files]
         tot_df = pd.concat(run_data)
 
         # force GC to free up lingering cuda allocs
@@ -426,11 +426,13 @@ if __name__ == "__main__":
             # Push output df to write queue
             write_queue.put((os.path.join(output_dir, level + "_quantiles.csv"), q_df))
 
-    pool = Pool(processes=args.nprocs)
-    for _ in tqdm(pool.imap_unordered(process_date, dates), total=len(dates)):
-        pass
-    pool.close()
-    pool.join()  # wait until everything is done
+    #pool = Pool(processes=args.nprocs)
+    #for _ in tqdm(pool.imap_unordered(process_date, dates), total=len(dates)):
+    #    pass
+    #pool.close()
+    #pool.join()  # wait until everything is done
+    for date in dates:
+        process_date(date)
 
     to_write.join()  # wait until queue is empty
     to_write.put(None)  # send signal to term loop

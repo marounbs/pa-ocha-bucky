@@ -29,6 +29,8 @@ from .util import (
 )
 from .util.distributions import mPERT_sample, truncnorm
 
+import cudf
+
 # supress pandas warning caused by pyarrow
 warnings.simplefilter(action="ignore", category=FutureWarning)
 # TODO we do alot of allowing div by 0 and then checking for nans later, we should probably refactor that
@@ -185,6 +187,7 @@ class SEIR_covid(object):
             self.adm2_id = np.fromiter(
                 nx.get_node_attributes(G, G.graph["adm2_key"]).values(), dtype=int
             )
+            self.adm2_id = xp.asarray(self.adm2_id)
 
             # Mapping from index to adm1
             self.adm1_id = np.fromiter(
@@ -213,6 +216,8 @@ class SEIR_covid(object):
             self.Nij = xp.asarray((np.vstack(list(N_age_init.values())) + 0.0001).T)
             self.Nj = xp.asarray(np.sum(self.Nij, axis=0))
             self.n_age_grps = self.Nij.shape[0]
+
+
 
             self.G = G
             n_nodes = len(self.G.nodes())
@@ -249,6 +254,7 @@ class SEIR_covid(object):
                     ),
                 }
 
+            self.Cij = self.Cij[:4]
             self.Cij = xp.broadcast_to(self.Cij, (n_nodes,) + self.Cij.shape)
             self.npi_params["contact_weights"] = self.npi_params["contact_weights"][
                 ..., None, None
@@ -810,7 +816,7 @@ class SEIR_covid(object):
 
         # do integration
         logging.debug("Starting integration")
-        t_eval = np.arange(0, self.t_max + self.dt, self.dt)
+        t_eval = xp.arange(0, self.t_max + self.dt, self.dt)
         sol = ivp.solve_ivp(
             self._dGdt_vec,
             method="RK23",
@@ -837,8 +843,8 @@ class SEIR_covid(object):
             # print(xp.sum(xp.sum(y[:incH],axis=0)-1.))
             # raise SimulationException
 
-        adm2_ids = np.broadcast_to(self.adm2_id[:, None], out.shape[1:])
-
+        adm2_ids = xp.broadcast_to(self.adm2_id[:, None], out.shape[1:])
+        #adm2_ids = xp.asarray(adm2_ids)
         n_time_steps = out.shape[-1]
 
         t_output = xp.to_cpu(sol.t)
@@ -847,6 +853,7 @@ class SEIR_covid(object):
             for t in t_output
         ]
         dates = np.broadcast_to(dates, out.shape[1:])
+        #dates = xp.asarray(dates)
 
         icu = (
             self.Nij[..., None]
@@ -902,12 +909,13 @@ class SEIR_covid(object):
         #    raise SimulationException
 
         out = out.reshape(y.shape[0], -1)
-
+        #from IPython import embed
+        #embed()
         # Grab pretty much everything interesting
         df_data = {
             "ADM2_ID": adm2_ids.reshape(-1),
             "date": dates.reshape(-1),
-            "rid": np.broadcast_to(seed, out.shape[-1]).reshape(-1),
+            "rid": xp.full(adm2_ids.reshape(-1).shape, seed), #xp.broadcast_to(seed, out.shape[-1]).reshape(-1),
             "S": out[Si],
             "E": out[Ei],
             "I": out[Ii],
@@ -924,16 +932,16 @@ class SEIR_covid(object):
             "CCR": cum_cases_reported.reshape(-1),
             "ICU": xp.sum(icu, axis=0).reshape(-1),
             "VENT": xp.sum(vent, axis=0).reshape(-1),
-            "CASE_REPORT": np.broadcast_to(
+            "CASE_REPORT": xp.broadcast_to(
                 self.params.CASE_REPORT[:, None], adm2_ids.shape
             ).reshape(-1),
             "Reff": (
                 self.npi_params["r0_reduct"].T
-                * np.broadcast_to(
-                    (self.params.R0 * (np.diag(self.A)))[:, None], adm2_ids.shape
+                * xp.broadcast_to(
+                    (self.params.R0 * (xp.diag(self.A)))[:, None], adm2_ids.shape
                 )
             ).reshape(-1),
-            "doubling_t": np.broadcast_to(
+            "doubling_t": xp.broadcast_to(
                 self.doubling_t[:, None], adm2_ids.shape
             ).reshape(-1),
         }
@@ -944,10 +952,13 @@ class SEIR_covid(object):
             if df_data[k].ndim == 2:
                 df_data[k] = xp.sum(df_data[k], axis=0)
 
-            df_data[k] = xp.to_cpu(df_data[k])
+            #df_data[k] = xp.to_cpu(df_data[k])
+            #print(k)
+            if k != 'date':
+                df_data[k] = xp.ascontiguousarray(df_data[k])
 
             if k != 'date':
-                if np.any(np.around(df_data[k],2) < 0.):
+                if xp.any(xp.around(df_data[k],2) < 0.):
                     logging.info('Negative values present in ' + k)
                     negative_values = True
 
@@ -959,18 +970,18 @@ class SEIR_covid(object):
         # Append data to the hdf5 file
         output_folder = os.path.join(outdir, self.run_id)
         os.makedirs(output_folder, exist_ok=True)
-        out_df = pd.DataFrame(data=df_data)
+        out_df = cudf.DataFrame(data=df_data)
 
         # round off any FP error we picked up along the way
-        out_df.set_index(["ADM2_ID", "date", "rid"], inplace=True)
-        out_df = out_df.apply(np.around, args=(3,))
-        out_df.reset_index(inplace=True)
+        #out_df.set_index(["ADM2_ID", "date", "rid"], inplace=True)
+        #out_df = out_df.apply(np.around, args=(3,))
+        #out_df.reset_index(inplace=True)
 
         if output:
             # out_df.to_feather(os.path.join(output_folder, str(seed) + ".feather"))
             for date, date_df in out_df.groupby("date"):
                 if output_queue is None:
-                    date_df.reset_index().to_feather(
+                    date_df.reset_index().to_parquet(
                         os.path.join(
                             output_folder,
                             str(seed) + "_" + str(date.date()) + ".feather",
@@ -1016,7 +1027,7 @@ if __name__ == "__main__":
     def writer():
         # Call to_write.get() until it returns None
         for fname, df in iter(to_write.get, None):
-            df.reset_index().to_feather(fname)
+            df.reset_index().to_parquet(fname)
 
     write_thread = threading.Thread(target=writer)
     write_thread.start()
